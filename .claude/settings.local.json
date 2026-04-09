@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(docker --version)",
+      "Bash(docker compose:*)",
+      "Bash(npm --version)",
+      "Bash(pip list:*)",
+      "Bash(pip show:*)",
+      "Bash(pg_isready)",
+      "Bash(redis-cli ping:*)",
+      "Bash(powershell -Command \"Start-Process 'C:\\\\\\\\Program Files\\\\\\\\Docker\\\\\\\\Docker\\\\\\\\Docker Desktop.exe'\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import fastapi, uvicorn, sqlalchemy, redis, pydantic_settings, algosdk; print\\('Core imports OK'\\)\")",
+      "Bash(python -c \"from config import settings; print\\('Config OK:', settings.REDIS_URL\\)\")",
+      "Bash(python -c \"from main import app; print\\('App import OK'\\)\")",
+      "Bash(python -c \"from llama_index.core import VectorStoreIndex; print\\('llama_index OK'\\)\")",
+      "Bash(uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(npm run:*)",
+      "Bash(curl -s http://localhost:8000/api/agents/status)",
+      "Bash(curl -s http://localhost:8000/api/cache/stats)",
+      "Bash(python -c \"from agents.master_agent import MasterAgent; from routers.autonomous import router; print\\('imports OK'\\)\")",
+      "Bash(uvicorn main:app --reload --port 8000)"
+    ]
+  }
+}

@@ -11,9 +11,10 @@ class Settings(BaseSettings):
     ORACLE_MNEMONIC: str = ""
     ORACLE_ADDRESS: str = ""
 
-    OPENAI_API_KEY: str = ""
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
-    OPENAI_CHAT_MODEL: str = "gpt-4o"
+    OPENAI_API_KEY: str = "ollama"
+    OPENAI_EMBEDDING_MODEL: str = "nomic-embed-text"
+    OPENAI_CHAT_MODEL: str = "llama3.2"
+    OPENAI_BASE_URL: str = "http://host.docker.internal:11434/v1"
 
     PINECONE_API_KEY: str = ""
     PINECONE_INDEX_NAME: str = "neuralledger-cache"

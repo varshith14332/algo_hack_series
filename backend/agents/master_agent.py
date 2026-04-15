@@ -1,386 +1,382 @@
 """
-MasterAgent — top-level autonomous agent.
+Master Agent — Autonomous multi-agent orchestrator with on-chain identity.
 
-After the user sets a goal and funds the master wallet, this agent runs
-everything with zero human interaction. It parses the goal into subtasks,
-discovers services, executes via the existing LangGraph sub-pipeline,
-assembles a final report, and returns a complete audit trail.
+Decomposes user goals into subtasks, discovers services, executes via agent-to-agent
+payments, and assembles final reports.
 """
-from openai import AsyncOpenAI
-from services.agent_wallet_service import AgentWalletService
-from agents.orchestrator import AgentOrchestrator
-from config import settings
-from datetime import datetime, timezone
-import hashlib
-import uuid
+import asyncio
 import json
+import uuid
 import logging
+import hashlib
+from datetime import datetime, timezone
+from services.agent_wallet_service import AgentWalletService
+from contracts.deploy.contract_client import ContractClient
+from agents.orchestrator import AgentOrchestrator
+from openai import AsyncOpenAI
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-agent_wallet_service = AgentWalletService()
-
-VALID_CATEGORIES = {"research", "data", "analysis", "writing"}
-
-WRITER_SYSTEM_PROMPT = """You are a professional report writer.
-Given multiple research findings, produce a single coherent, well-structured report.
-Include: Executive Summary, Key Findings per section, Risk Assessment (if applicable), Conclusion.
-Use markdown formatting."""
-
 
 class MasterAgent:
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    KNOWN_CATEGORIES = ["research", "data", "analysis", "writing"]
+    BUDGET_WARNING_THRESHOLD = 0.90  # stop at 90% spent
+
+    def __init__(self, user_wallet_address: str, budget_algo: float):
+        self.user_wallet_address = user_wallet_address
+        self.budget_algo = budget_algo
+        self.budget_microalgo = int(budget_algo * 1_000_000)
+        self.spent_microalgo = 0
+        self.audit_trail = []
+        self.wallet_service = AgentWalletService()
+        self.contract_client = ContractClient()
         self.orchestrator = AgentOrchestrator()
-        # Master agent's own Algorand wallet
-        self._private_key, self.address = agent_wallet_service.generate_agent_account("master")
-        logger.info(f"[MasterAgent] Wallet: {self.address[:16]}...")
-
-    async def _register_identity(self, owner_address: str, spending_limit_microalgo: int, allowed_categories: str) -> str:
-        """Register master agent in IdentityRegistry on first run."""
-        try:
-            from contracts.deploy.contract_client import ContractClient
-            client = ContractClient()
-            tx_id = await client.register_agent(
-                agent_address=self.address,
-                owner_address=owner_address,
-                spending_limit=spending_limit_microalgo,
-                allowed_categories=allowed_categories,
-            )
-            logger.info(f"[MasterAgent] Registered on-chain: {tx_id}")
-            return tx_id
-        except Exception as e:
-            logger.warning(f"[MasterAgent] Identity registration failed (dev mode ok): {e}")
-            return f"dev-master-{self.address[:16]}"
-
-    async def _parse_goal(self, goal: str) -> list[dict]:
-        """Use GPT-4o to break a goal into typed subtasks."""
-        try:
-            resp = await self.client.chat.completions.create(
-                model=settings.OPENAI_CHAT_MODEL,
-                temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Break the user's goal into subtasks. "
-                            "Each subtask needs: name (string), category (one of: research, data, analysis, writing), "
-                            "description (string, 1-2 sentences). "
-                            "Return JSON: {\"subtasks\": [{\"name\": ..., \"category\": ..., \"description\": ...}]}"
-                        ),
-                    },
-                    {"role": "user", "content": goal},
-                ],
-            )
-            data = json.loads(resp.choices[0].message.content)
-            subtasks = data.get("subtasks", [])
-            # Validate categories
-            for st in subtasks:
-                if st.get("category") not in VALID_CATEGORIES:
-                    st["category"] = "analysis"
-            return subtasks
-        except Exception as e:
-            logger.error(f"[MasterAgent] Goal parsing failed: {e}")
-            # Fallback: single analysis subtask
-            return [{"name": "Main Task", "category": "analysis", "description": goal}]
-
-    async def _discover_service(self, category: str, audit_trail: list) -> dict | None:
-        """Find the cheapest service with reputation >= MIN_AGENT_REPUTATION."""
-        try:
-            from contracts.deploy.contract_client import ContractClient
-            client = ContractClient()
-            services = await client.discover_services(category)
-            min_rep = settings.MIN_AGENT_REPUTATION
-            qualified = [s for s in services if s.get("reputation_score", 0) >= min_rep]
-            if qualified:
-                chosen = min(qualified, key=lambda s: s.get("price_microalgo", 999_999_999))
-                audit_trail.append({
-                    "agent": "master",
-                    "action": "service_selected",
-                    "detail": (
-                        f"Discovered {len(services)} services for '{category}', "
-                        f"selected '{chosen.get('service_name')}' "
-                        f"(reputation={chosen.get('reputation_score', 0)}, "
-                        f"price={chosen.get('price_microalgo', 0) / 1_000_000} ALGO)"
-                    ),
-                    "payment_algo": None,
-                    "tx_id": None,
-                    "timestamp": _now(),
-                })
-                return chosen
-        except Exception as e:
-            logger.warning(f"[MasterAgent] Service discovery failed for {category}: {e}")
-
-        audit_trail.append({
-            "agent": "master",
-            "action": "no_service_found",
-            "detail": f"No qualified external service for '{category}' — using local pipeline",
-            "payment_algo": None,
-            "tx_id": None,
-            "timestamp": _now(),
-        })
-        return None
-
-    async def _execute_subtask(
-        self,
-        subtask: dict,
-        audit_trail: list,
-        owner_address: str,
-        total_spent_microalgo: int,
-        budget_microalgo: int,
-    ) -> tuple[dict, int]:
-        """Run a single subtask through the agent pipeline. Returns (result_state, new_spent)."""
-        name = subtask["name"]
-        category = subtask["category"]
-        description = subtask["description"]
-
-        task_id = str(uuid.uuid4())
-        task_hash = hashlib.sha256(f"{name}:{description}".encode()).hexdigest()
-
-        audit_trail.append({
-            "agent": "master",
-            "action": "subtask_start",
-            "detail": f"Starting subtask '{name}' (category={category})",
-            "payment_algo": None,
-            "tx_id": None,
-            "timestamp": _now(),
-        })
-
-        # Budget guard: stop if >90% spent
-        if total_spent_microalgo >= int(budget_microalgo * 0.9):
-            audit_trail.append({
-                "agent": "master",
-                "action": "budget_guard",
-                "detail": f"Skipping '{name}': 90% budget threshold reached",
-                "payment_algo": None,
-                "tx_id": None,
-                "timestamp": _now(),
-            })
-            return {"status": "skipped", "result": None, "task_id": task_id}, total_spent_microalgo
-
-        final_state = await self.orchestrator.run(
-            task_id=task_id,
-            task_hash=task_hash,
-            task_text=description,
-            task_type=category if category in ("summarize", "extract", "analyze") else "analyze",
-            requester=owner_address,
-            tx_id=f"master:{self.address[:16]}",
-            audit_trail=list(audit_trail),
+        self.openai = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            base_url=settings.OPENAI_BASE_URL if settings.OPENAI_BASE_URL else None,
         )
+        self.agent_address = None
+        self.task_id = str(uuid.uuid4())
 
-        # Accumulate audit events from sub-pipeline
-        for entry in final_state.get("audit_trail", []):
-            if entry not in audit_trail:
-                entry["timestamp"] = entry.get("timestamp", _now())
-                audit_trail.append(entry)
-
-        subtask_cost = int(settings.NEW_TASK_PRICE_ALGO * 1_000_000)
-        if final_state.get("from_cache"):
-            subtask_cost = int(settings.CACHED_TASK_PRICE_ALGO * 1_000_000)
-
-        total_spent_microalgo += subtask_cost
-
-        audit_trail.append({
-            "agent": "master",
-            "action": "subtask_complete",
-            "detail": (
-                f"Subtask '{name}' complete — status={final_state.get('status')}, "
-                f"cost={subtask_cost/1_000_000} ALGO"
-            ),
-            "payment_algo": subtask_cost / 1_000_000,
-            "tx_id": final_state.get("merkle_root", "")[:16] or None,
-            "timestamp": _now(),
-        })
-
-        return final_state, total_spent_microalgo
-
-    async def _write_final_report(self, goal: str, subtask_results: list[dict]) -> str:
-        """Use WriterAgent (GPT-4o) to assemble subtask results into a final report."""
-        findings = "\n\n".join(
-            f"### {r.get('name', f'Subtask {i+1}')}\n{r.get('result', 'No result')}"
-            for i, r in enumerate(subtask_results)
-            if r.get("result")
-        )
-
-        if not findings:
-            return "No results were produced. Please check agent logs."
-
-        try:
-            resp = await self.client.chat.completions.create(
-                model=settings.OPENAI_CHAT_MODEL,
-                temperature=0.3,
-                messages=[
-                    {"role": "system", "content": WRITER_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"Goal: {goal}\n\nFindings:\n{findings}",
-                    },
-                ],
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            logger.error(f"[MasterAgent] WriterAgent failed: {e}")
-            return findings
-
-    async def run(
-        self,
-        goal: str,
-        budget_algo: float,
-        owner_address: str,
-        task_id: str,
-    ) -> dict:
+    async def initialize(self):
         """
-        Entry point. Runs the full autonomous pipeline.
-        Returns complete result with audit trail.
+        Register master agent on-chain and fund its wallet.
+        Call this before run().
+        
+        Steps:
+        1. Get agent address via wallet_service.get_address("master")
+        2. Fund agent wallet
+        3. Register on IdentityRegistry
+        4. Append to audit_trail
         """
-        audit_trail: list = []
-        budget_microalgo = int(budget_algo * 1_000_000)
-        total_spent_microalgo = 0
-
-        # ── Step 1: Register identity on-chain ───────────────────
-        reg_tx = await self._register_identity(
-            owner_address=owner_address,
-            spending_limit_microalgo=budget_microalgo,
-            allowed_categories=",".join(VALID_CATEGORIES),
-        )
-        audit_trail.append({
-            "agent": "master",
-            "action": "identity_registered",
-            "detail": f"Master agent registered on-chain with {budget_algo} ALGO budget",
-            "payment_algo": None,
-            "tx_id": reg_tx,
-            "timestamp": _now(),
+        # Get agent address
+        self.agent_address = await self.wallet_service.get_address("master")
+        logger.info(f"[MasterAgent] Address: {self.agent_address}")
+        
+        # Fund agent wallet
+        try:
+            tx_id = await self.wallet_service.fund_agent("master", self.budget_algo)
+            logger.info(f"[MasterAgent] Funded with {self.budget_algo} ALGO, txID={tx_id}")
+        except Exception as e:
+            logger.warning(f"[MasterAgent] Funding failed: {e} (continuing anyway)")
+        
+        # Register on IdentityRegistry
+        try:
+            await self.contract_client.register_agent(
+                agent_address=self.agent_address,
+                owner_address=self.user_wallet_address,
+                spending_limit=self.budget_microalgo,
+                allowed_categories=",".join(self.KNOWN_CATEGORIES),
+            )
+            logger.info(f"[MasterAgent] Registered on IdentityRegistry")
+        except Exception as e:
+            logger.warning(f"[MasterAgent] Registration failed: {e} (continuing anyway)")
+        
+        # Audit trail
+        self.audit_trail.append({
+            "event": "master_agent_initialized",
+            "agent_address": self.agent_address,
+            "budget_algo": self.budget_algo,
+            "owner": self.user_wallet_address,
+            "timestamp": self._utc_now(),
         })
 
-        # Persist initial status for polling
-        await _save_status(task_id, {
-            "status": "running",
-            "current_step": "Parsing goal into subtasks",
-            "progress_percent": 5,
-            "audit_trail": audit_trail,
-        })
-
-        # ── Step 2: Parse goal into subtasks ─────────────────────
+    async def run(self, goal: str) -> dict:
+        """
+        Main entry point. Runs entire pipeline autonomously.
+        
+        Returns final result dict with:
+        - task_id
+        - status
+        - goal
+        - final_output
+        - subtasks_completed
+        - subtasks_total
+        - total_spent_algo
+        - budget_remaining_algo
+        - audit_trail
+        - agent_address
+        """
+        logger.info(f"[MasterAgent] Starting pipeline for goal: {goal[:100]}...")
+        
+        # Parse goal into subtasks
         subtasks = await self._parse_goal(goal)
-        audit_trail.append({
-            "agent": "master",
-            "action": "goal_parsed",
-            "detail": f"Goal broken into {len(subtasks)} subtask(s): {', '.join(s['name'] for s in subtasks)}",
-            "payment_algo": None,
-            "tx_id": None,
-            "timestamp": _now(),
-        })
-
-        await _save_status(task_id, {
-            "status": "running",
-            "current_step": f"Executing {len(subtasks)} subtasks",
-            "progress_percent": 15,
-            "audit_trail": audit_trail,
-        })
-
-        # ── Step 3: Execute subtasks sequentially ────────────────
-        subtask_results = []
-        merkle_roots = []
-
+        results = []
+        
         for i, subtask in enumerate(subtasks):
-            progress = 15 + int(60 * (i / max(len(subtasks), 1)))
-            await _save_status(task_id, {
-                "status": "running",
-                "current_step": f"Executing subtask {i+1}/{len(subtasks)}: {subtask['name']}",
-                "progress_percent": progress,
-                "audit_trail": audit_trail,
-            })
-
-            # Discover service for this subtask category
-            await self._discover_service(subtask["category"], audit_trail)
-
-            final_state, total_spent_microalgo = await self._execute_subtask(
-                subtask=subtask,
-                audit_trail=audit_trail,
-                owner_address=owner_address,
-                total_spent_microalgo=total_spent_microalgo,
-                budget_microalgo=budget_microalgo,
-            )
-
-            subtask_results.append({
-                "name": subtask["name"],
-                "category": subtask["category"],
-                "result": final_state.get("result"),
-                "status": final_state.get("status"),
-                "merkle_root": final_state.get("merkle_root"),
-                "ipfs_cid": final_state.get("ipfs_cid"),
-            })
-
-            if final_state.get("merkle_root"):
-                merkle_roots.append(final_state["merkle_root"])
-
-        # ── Step 4: Assemble final report ────────────────────────
-        await _save_status(task_id, {
-            "status": "running",
-            "current_step": "WriterAgent producing final report",
-            "progress_percent": 85,
-            "audit_trail": audit_trail,
-        })
-
-        audit_trail.append({
-            "agent": "master",
-            "action": "writing_report",
-            "detail": "WriterAgent producing final structured report from all subtask results",
-            "payment_algo": None,
-            "tx_id": None,
-            "timestamp": _now(),
-        })
-
-        final_output = await self._write_final_report(goal, subtask_results)
-
-        total_spent_algo = total_spent_microalgo / 1_000_000
-        audit_trail.append({
-            "agent": "master",
-            "action": "pipeline_complete",
-            "detail": (
-                f"Pipeline complete — {len(subtasks)} subtasks, "
-                f"spent {total_spent_algo:.4f} ALGO of {budget_algo} ALGO budget"
-            ),
-            "payment_algo": total_spent_algo,
-            "tx_id": None,
-            "timestamp": _now(),
-        })
-
-        result = {
-            "status": "complete",
+            # Check budget
+            if self.spent_microalgo >= self.BUDGET_WARNING_THRESHOLD * self.budget_microalgo:
+                logger.warning(f"[MasterAgent] Budget threshold reached ({self.BUDGET_WARNING_THRESHOLD*100}%)")
+                self.audit_trail.append({
+                    "event": "budget_threshold_reached",
+                    "spent_microalgo": self.spent_microalgo,
+                    "budget_microalgo": self.budget_microalgo,
+                    "timestamp": self._utc_now(),
+                })
+                break
+            
+            logger.info(f"[MasterAgent] Processing subtask {i+1}/{len(subtasks)}: {subtask['name']}")
+            
+            # Discover service
+            best_service = await self._discover_service(subtask["category"])
+            if not best_service:
+                logger.warning(f"[MasterAgent] No service found for category '{subtask['category']}'")
+                continue
+            
+            # Execute subtask
+            result = await self._execute_subtask(subtask, best_service)
+            if result:
+                results.append(result)
+        
+        # Assemble final report
+        final_output = await self._assemble_report(goal, results)
+        
+        return {
+            "task_id": self.task_id,
+            "status": "completed",
+            "goal": goal,
             "final_output": final_output,
-            "total_spent_algo": total_spent_algo,
-            "subtasks_completed": len([r for r in subtask_results if r.get("result")]),
-            "audit_trail": audit_trail,
-            "merkle_roots": merkle_roots,
-            "master_agent_address": self.address,
+            "subtasks_completed": len(results),
+            "subtasks_total": len(subtasks),
+            "total_spent_algo": self.spent_microalgo / 1_000_000,
+            "budget_remaining_algo": (self.budget_microalgo - self.spent_microalgo) / 1_000_000,
+            "audit_trail": self.audit_trail,
+            "agent_address": self.agent_address,
         }
 
-        await _save_status(task_id, {
-            "status": "complete",
-            "current_step": "Done",
-            "progress_percent": 100,
-            "audit_trail": audit_trail,
-            "result": result,
-        })
-
-        return result
-
-
-async def _save_status(task_id: str, data: dict):
-    """Persist task status in Redis for polling."""
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        await redis.setex(
-            f"autonomous:{task_id}",
-            3600 * 24,
-            json.dumps(data, default=str),
+    async def _parse_goal(self, goal: str) -> list[dict]:
+        """
+        Use GPT-4o to parse goal into subtasks.
+        
+        Returns list of dicts with: name, category, description, estimated_complexity
+        """
+        system_prompt = (
+            "You are a task decomposition engine. Break the user goal into 2-4 concrete subtasks. "
+            f"Each subtask must have a category from: {', '.join(self.KNOWN_CATEGORIES)}. "
+            "Return ONLY a valid JSON array. No markdown. No explanation. "
+            "Each item: {\"name\": str, \"category\": str, \"description\": str, \"estimated_complexity\": str}"
         )
-    except Exception as e:
-        logger.error(f"_save_status failed: {e}")
+        
+        try:
+            response = await self.openai.chat.completions.create(
+                model=settings.OPENAI_CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": goal},
+                ],
+                temperature=0.3,
+                max_tokens=1000,
+            )
+            
+            content = response.choices[0].message.content.strip()
+            # Remove markdown code blocks if present
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            
+            subtasks = json.loads(content)
+            
+            self.audit_trail.append({
+                "event": "goal_parsed",
+                "subtasks": subtasks,
+                "timestamp": self._utc_now(),
+            })
+            
+            logger.info(f"[MasterAgent] Parsed {len(subtasks)} subtasks")
+            return subtasks
+            
+        except Exception as e:
+            logger.error(f"[MasterAgent] Goal parsing failed: {e}")
+            # Fallback: single subtask
+            return [{
+                "name": "complete_task",
+                "category": "research",
+                "description": goal,
+                "estimated_complexity": "medium",
+            }]
 
+    async def _discover_service(self, category: str) -> dict | None:
+        """
+        Find best available service for a category.
+        
+        Returns service dict or None if no qualified service found.
+        """
+        try:
+            services = await self.contract_client.discover_services(category)
+            
+            if not services:
+                logger.warning(f"[MasterAgent] No services found for category '{category}'")
+                return None
+            
+            # Get reputation scores
+            qualified = []
+            for service in services:
+                try:
+                    score = await self.contract_client.get_agent_score(service["agent_address"])
+                    if score >= settings.MIN_AGENT_REPUTATION:
+                        service["reputation_score"] = score
+                        qualified.append(service)
+                except Exception:
+                    pass
+            
+            if not qualified:
+                logger.warning(f"[MasterAgent] No qualified services for category '{category}'")
+                return None
+            
+            # Sort by price ascending, pick cheapest
+            qualified.sort(key=lambda s: s.get("price_microalgo", 999999))
+            selected = qualified[0]
+            
+            self.audit_trail.append({
+                "event": "service_discovered",
+                "category": category,
+                "selected_agent": selected["agent_address"],
+                "price_algo": selected["price_microalgo"] / 1_000_000,
+                "reputation_score": selected.get("reputation_score", 0),
+                "candidates_found": len(services),
+                "candidates_qualified": len(qualified),
+                "timestamp": self._utc_now(),
+            })
+            
+            return selected
+            
+        except Exception as e:
+            logger.error(f"[MasterAgent] Service discovery failed: {e}")
+            return None
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    async def _execute_subtask(self, subtask: dict, service: dict) -> str | None:
+        """
+        Execute a single subtask using a discovered service.
+        
+        Makes HTTP request to backend task endpoint AS AN AGENT.
+        Returns result string or None on failure.
+        """
+        task_hash = hashlib.sha256(subtask["description"].encode()).hexdigest()
+        
+        # Check semantic cache first
+        try:
+            from services.cache_service import CacheService
+            cache = CacheService()
+            cached = await cache.check_semantic(subtask["description"])
+            if cached:
+                cached_result = await cache.get(cached["task_hash"])
+                if cached_result:
+                    cost_microalgo = int(settings.CACHED_TASK_PRICE_ALGO * 1_000_000)
+                    self.spent_microalgo += cost_microalgo
+                    
+                    self.audit_trail.append({
+                        "event": "cache_hit",
+                        "subtask": subtask["name"],
+                        "cost_algo": settings.CACHED_TASK_PRICE_ALGO,
+                        "similarity_score": cached["score"],
+                        "timestamp": self._utc_now(),
+                    })
+                    
+                    logger.info(f"[MasterAgent] Cache hit for subtask '{subtask['name']}'")
+                    return cached_result["result"]
+        except Exception as e:
+            logger.warning(f"[MasterAgent] Cache check failed: {e}")
+        
+        # Make HTTP request as agent
+        try:
+            import httpx
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{settings.BACKEND_URL}/api/tasks/run",
+                    headers={
+                        "X-Agent-Mode": "true",
+                        "X-Agent-Address": self.agent_address,
+                        "X-Task-Hash": task_hash,
+                        "X-Category": subtask["category"],
+                    },
+                    data={
+                        "task_type": subtask["category"],
+                        "prompt": subtask["description"],
+                    },
+                    timeout=60.0,
+                )
+                
+                if response.status_code == 403:
+                    self.audit_trail.append({
+                        "event": "authorization_failed",
+                        "subtask": subtask["name"],
+                        "reason": "Agent verification failed",
+                        "timestamp": self._utc_now(),
+                    })
+                    logger.error(f"[MasterAgent] Authorization failed for subtask '{subtask['name']}'")
+                    return None
+                
+                if response.status_code == 200:
+                    data = response.json()["data"]
+                    cost_microalgo = int(settings.NEW_TASK_PRICE_ALGO * 1_000_000)
+                    self.spent_microalgo += cost_microalgo
+                    
+                    self.audit_trail.append({
+                        "event": "subtask_completed",
+                        "subtask": subtask["name"],
+                        "agent_used": service["agent_address"],
+                        "cost_algo": settings.NEW_TASK_PRICE_ALGO,
+                        "from_cache": data.get("from_cache", False),
+                        "merkle_root": data.get("merkle_root"),
+                        "verification_score": data.get("verification_score"),
+                        "timestamp": self._utc_now(),
+                    })
+                    
+                    logger.info(f"[MasterAgent] Subtask '{subtask['name']}' completed")
+                    return data.get("result")
+                
+                logger.error(f"[MasterAgent] Subtask request failed: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"[MasterAgent] Subtask execution failed: {e}")
+            self.audit_trail.append({
+                "event": "subtask_error",
+                "subtask": subtask["name"],
+                "error": str(e),
+                "timestamp": self._utc_now(),
+            })
+            return None
+
+    async def _assemble_report(self, goal: str, results: list[str]) -> str:
+        """
+        Use GPT-4o to assemble subtask results into a final coherent report.
+        
+        Returns assembled report string.
+        """
+        if not results:
+            return "No results were produced. The agent pipeline encountered errors or budget constraints."
+        
+        prompt = (
+            f"You are a report writer. The user's original goal was: {goal}\n\n"
+            f"Here are the research findings from multiple specialist agents:\n"
+            + "\n".join(f"Finding {i+1}: {r}" for i, r in enumerate(results))
+            + "\n\nWrite a clear, structured, professional report that synthesizes all findings. "
+            "Include: executive summary, key findings per topic, risks identified, and recommendations."
+        )
+        
+        try:
+            response = await self.openai.chat.completions.create(
+                model=settings.OPENAI_CHAT_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a professional report writer."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.5,
+                max_tokens=2048,
+            )
+            
+            report = response.choices[0].message.content.strip()
+            logger.info(f"[MasterAgent] Report assembled ({len(report)} chars)")
+            return report
+            
+        except Exception as e:
+            logger.error(f"[MasterAgent] Report assembly failed: {e}")
+            # Fallback: simple concatenation
+            return "\n\n".join(f"## Finding {i+1}\n{r}" for i, r in enumerate(results))
+
+    def _utc_now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()

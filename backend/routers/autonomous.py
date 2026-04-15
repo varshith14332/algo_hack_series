@@ -1,231 +1,278 @@
 """
-Autonomous agent pipeline router.
+Autonomous Agent Pipeline Router
 
-POST /api/autonomous/run   — launch master agent for a goal
-GET  /api/autonomous/status/{task_id} — poll progress
-GET  /api/autonomous/audit/{task_id}  — full audit trail once done
+Allows users to launch fully autonomous multi-agent workflows with budget control.
 """
 from fastapi import APIRouter, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-from services.algorand_service import AlgorandService
+from algosdk import encoding
 from agents.master_agent import MasterAgent
+from db.redis_client import get_redis
+from services.agent_wallet_service import AgentWalletService
+from config import settings
 from datetime import datetime, timezone
-import uuid
 import json
+import uuid
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-algorand = AlgorandService()
-
-# Rate limit: 3 concurrent autonomous runs per owner (checked in Redis)
-CONCURRENT_LIMIT = 3
-CONCURRENT_WINDOW = 300  # 5 minutes
-
-_master_agent: MasterAgent | None = None
 
 
-def _get_master_agent() -> MasterAgent:
-    global _master_agent
-    if _master_agent is None:
-        _master_agent = MasterAgent()
-    return _master_agent
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _envelope(success: bool, data=None, error=None):
-    return {"success": success, "data": data, "error": error, "timestamp": _now()}
-
-
-class RunRequest(BaseModel):
+class AutonomousRunRequest(BaseModel):
     goal: str
     budget_algo: float
     owner_address: str
 
-    @field_validator("owner_address")
+    @field_validator("goal")
     @classmethod
-    def validate_address(cls, v: str) -> str:
-        if len(v) != 58:
-            raise ValueError("owner_address must be a 58-character Algorand address")
-        return v
+    def goal_not_empty(cls, v):
+        if not v or len(v.strip()) < 10:
+            raise ValueError("Goal must be at least 10 characters")
+        if len(v) > 1000:
+            raise ValueError("Goal must be under 1000 characters")
+        return v.strip()
 
     @field_validator("budget_algo")
     @classmethod
-    def validate_budget(cls, v: float) -> float:
+    def budget_in_range(cls, v):
         if v < 0.5 or v > 50:
-            raise ValueError("budget_algo must be between 0.5 and 50")
+            raise ValueError("Budget must be between 0.5 and 50 ALGO")
+        return v
+
+    @field_validator("owner_address")
+    @classmethod
+    def valid_algorand_address(cls, v):
+        if not encoding.is_valid_address(v):
+            raise ValueError("Invalid Algorand address")
         return v
 
 
-async def _check_concurrent_limit(owner_address: str) -> bool:
-    """Return True if owner is within the concurrent run limit."""
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        key = f"autonomous_runs:{owner_address}"
-        count = await redis.get(key)
-        if count and int(count) >= CONCURRENT_LIMIT:
-            return False
-        pipe = redis.pipeline()
-        await pipe.incr(key)
-        await pipe.expire(key, CONCURRENT_WINDOW)
-        await pipe.execute()
-        return True
-    except Exception:
-        return True  # Fail open
-
-
-async def _decrement_concurrent(owner_address: str):
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        key = f"autonomous_runs:{owner_address}"
-        await redis.decr(key)
-    except Exception:
-        pass
-
-
-async def _run_pipeline(task_id: str, goal: str, budget_algo: float, owner_address: str):
-    """Background task: run the master agent pipeline."""
-    try:
-        agent = _get_master_agent()
-        await agent.run(
-            goal=goal,
-            budget_algo=budget_algo,
-            owner_address=owner_address,
-            task_id=task_id,
-        )
-    except Exception as e:
-        logger.error(f"[autonomous] Pipeline failed for task {task_id}: {e}")
-        try:
-            from db.redis_client import get_redis
-            redis = await get_redis()
-            await redis.setex(
-                f"autonomous:{task_id}",
-                3600 * 24,
-                json.dumps({
-                    "status": "failed",
-                    "current_step": "Error",
-                    "progress_percent": 0,
-                    "audit_trail": [],
-                    "error": str(e),
-                }),
-            )
-        except Exception:
-            pass
-    finally:
-        await _decrement_concurrent(owner_address)
-
-
 @router.post("/run")
-async def run_autonomous(req: RunRequest, background_tasks: BackgroundTasks):
+async def run_autonomous_pipeline(
+    request: AutonomousRunRequest,
+    background_tasks: BackgroundTasks,
+):
     """
-    Launch the master agent pipeline for a goal.
-    Does NOT require x402 payment — the master agent funds itself internally.
-    Rate limited to 3 concurrent runs per owner_address.
+    Launch an autonomous agent pipeline.
+    
+    Rate limit: max 3 concurrent runs per owner address.
+    
+    Returns:
+        task_id: unique identifier for polling status
+        master_agent_address: the agent's on-chain identity
+        estimated_cost_algo: rough estimate of total cost
     """
-    if not algorand.validate_address(req.owner_address):
-        return JSONResponse(
-            status_code=400,
-            content=_envelope(False, error="Invalid Algorand address format"),
-        )
-
-    allowed = await _check_concurrent_limit(req.owner_address)
-    if not allowed:
+    redis = await get_redis()
+    
+    # Rate limit check
+    rate_key = f"rate_limit:autonomous:{request.owner_address}"
+    count = await redis.get(rate_key)
+    if count and int(count) >= 3:
         return JSONResponse(
             status_code=429,
-            content=_envelope(
-                False,
-                error=f"Rate limit: max {CONCURRENT_LIMIT} concurrent autonomous runs per address (5-minute window)",
-            ),
+            content={
+                "success": False,
+                "error": "Max 3 concurrent autonomous runs per address",
+                "data": None,
+                "timestamp": _utc_now(),
+            }
         )
-
+    
+    # Increment rate limit counter
+    await redis.incr(rate_key)
+    await redis.expire(rate_key, 300)  # 5 minutes
+    
+    # Generate task ID
     task_id = str(uuid.uuid4())
-    agent = _get_master_agent()
-
-    # Persist initial state immediately so polling works right away
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        await redis.setex(
-            f"autonomous:{task_id}",
-            3600 * 24,
-            json.dumps({
-                "status": "running",
-                "current_step": "Initialising master agent",
-                "progress_percent": 0,
-                "audit_trail": [],
-            }),
-        )
-    except Exception:
-        pass
-
+    
+    # Store initial status
+    initial_status = {
+        "status": "initializing",
+        "progress_percent": 0,
+        "current_step": "Setting up agent wallets",
+        "audit_trail": [],
+        "result": None,
+        "goal": request.goal,
+        "budget_algo": request.budget_algo,
+    }
+    await redis.setex(
+        f"autonomous:{task_id}",
+        3600,  # 1 hour TTL
+        json.dumps(initial_status)
+    )
+    
+    # Get master agent address (without running full pipeline yet)
+    wallet_service = AgentWalletService()
+    master_address = await wallet_service.get_address("master")
+    
+    # Launch background task
     background_tasks.add_task(
-        _run_pipeline,
-        task_id=task_id,
-        goal=req.goal,
-        budget_algo=req.budget_algo,
-        owner_address=req.owner_address,
+        _run_autonomous_pipeline,
+        task_id,
+        request.goal,
+        request.budget_algo,
+        request.owner_address,
+    )
+    
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": {
+                "task_id": task_id,
+                "status": "initializing",
+                "master_agent_address": master_address,
+                "estimated_cost_algo": request.budget_algo * 0.4,
+                "message": f"Agent pipeline launched. Poll /autonomous/status/{task_id}",
+            },
+            "error": None,
+            "timestamp": _utc_now(),
+        }
     )
 
-    # Estimate cost: research ~0.3, analysis ~0.4, writing ~0.2
-    estimated = min(req.budget_algo * 0.45, req.budget_algo)
 
-    return JSONResponse(content=_envelope(True, {
-        "task_id": task_id,
-        "status": "running",
-        "master_agent_address": agent.address,
-        "estimated_cost_algo": round(estimated, 4),
-        "budget_algo": req.budget_algo,
-    }))
+async def _run_autonomous_pipeline(
+    task_id: str,
+    goal: str,
+    budget_algo: float,
+    owner_address: str,
+):
+    """
+    Background task that runs the full pipeline and updates Redis.
+    """
+    redis = await get_redis()
+    
+    async def update_status(step: str, progress: int, extra: dict = None):
+        try:
+            current_str = await redis.get(f"autonomous:{task_id}")
+            current = json.loads(current_str) if current_str else {}
+            current.update({
+                "current_step": step,
+                "progress_percent": progress,
+            })
+            if extra:
+                current.update(extra)
+            await redis.setex(f"autonomous:{task_id}", 3600, json.dumps(current))
+        except Exception as e:
+            logger.error(f"update_status failed: {e}")
+    
+    try:
+        await update_status("Initializing agent identity", 5)
+        
+        agent = MasterAgent(
+            user_wallet_address=owner_address,
+            budget_algo=budget_algo,
+        )
+        
+        await update_status("Registering on Algorand", 10)
+        await agent.initialize()
+        
+        await update_status("Parsing goal into subtasks", 20)
+        
+        await update_status("Running agent pipeline", 30)
+        result = await agent.run(goal)
+        
+        await update_status(
+            "Pipeline complete",
+            100,
+            {
+                "status": "completed",
+                "result": result,
+                "audit_trail": result["audit_trail"],
+            }
+        )
+        
+        logger.info(f"[Autonomous] Pipeline {task_id} completed successfully")
+        
+    except Exception as e:
+        logger.error(f"[Autonomous] Pipeline {task_id} failed: {e}")
+        await update_status(
+            "Pipeline failed",
+            0,
+            {
+                "status": "failed",
+                "error": str(e),
+            }
+        )
+    
+    finally:
+        # Decrement rate limit counter
+        rate_key = f"rate_limit:autonomous:{owner_address}"
+        count = await redis.get(rate_key)
+        if count and int(count) > 0:
+            await redis.decr(rate_key)
 
 
 @router.get("/status/{task_id}")
-async def get_status(task_id: str):
-    """Poll current status: progress, current step, partial audit trail, result if done."""
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        raw = await redis.get(f"autonomous:{task_id}")
-        if not raw:
-            return JSONResponse(
-                status_code=404,
-                content=_envelope(False, error="Task not found"),
-            )
-        data = json.loads(raw)
-        return JSONResponse(content=_envelope(True, data))
-    except Exception as e:
+async def get_autonomous_status(task_id: str):
+    """
+    Poll status of an autonomous pipeline.
+    
+    Returns current progress, step, and result when complete.
+    """
+    redis = await get_redis()
+    data_str = await redis.get(f"autonomous:{task_id}")
+    
+    if not data_str:
         return JSONResponse(
-            status_code=500,
-            content=_envelope(False, error=str(e)),
+            status_code=404,
+            content={
+                "success": False,
+                "error": "Task not found",
+                "data": None,
+                "timestamp": _utc_now(),
+            }
         )
+    
+    data = json.loads(data_str)
+    
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": data,
+            "error": None,
+            "timestamp": _utc_now(),
+        }
+    )
 
 
 @router.get("/audit/{task_id}")
-async def get_audit(task_id: str):
-    """Return the complete audit trail for a finished task."""
-    try:
-        from db.redis_client import get_redis
-        redis = await get_redis()
-        raw = await redis.get(f"autonomous:{task_id}")
-        if not raw:
-            return JSONResponse(
-                status_code=404,
-                content=_envelope(False, error="Task not found"),
-            )
-        data = json.loads(raw)
-        return JSONResponse(content=_envelope(True, {
-            "task_id": task_id,
-            "status": data.get("status"),
-            "audit_trail": data.get("audit_trail", []),
-            "result": data.get("result"),
-        }))
-    except Exception as e:
+async def get_autonomous_audit(task_id: str):
+    """
+    Get audit trail for a completed autonomous pipeline.
+    """
+    redis = await get_redis()
+    data_str = await redis.get(f"autonomous:{task_id}")
+    
+    if not data_str:
         return JSONResponse(
-            status_code=500,
-            content=_envelope(False, error=str(e)),
+            status_code=404,
+            content={
+                "success": False,
+                "error": "Task not found",
+                "data": None,
+                "timestamp": _utc_now(),
+            }
         )
+    
+    data = json.loads(data_str)
+    audit_trail = data.get("audit_trail", [])
+    status = data.get("status", "unknown")
+    
+    return JSONResponse(
+        content={
+            "success": True,
+            "data": {
+                "audit_trail": audit_trail,
+                "status": status,
+                "note": "Partial trail" if status != "completed" else "Complete",
+            },
+            "error": None,
+            "timestamp": _utc_now(),
+        }
+    )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()

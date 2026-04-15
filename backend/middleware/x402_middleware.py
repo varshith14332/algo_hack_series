@@ -46,62 +46,74 @@ class X402Middleware(BaseHTTPMiddleware):
         if path not in PROTECTED_ROUTES:
             return await call_next(request)
 
+        # AGENT MODE DETECTION — must run BEFORE human mode
         agent_mode = request.headers.get("X-Agent-Mode", "").lower() == "true"
+        agent_address = request.headers.get("X-Agent-Address", "")
+        category = request.headers.get("X-Category", "general")
+        task_hash = request.headers.get("X-Task-Hash", "")
 
         if agent_mode:
-            return await self._handle_agent_mode(request, call_next)
-        else:
-            return await self._handle_human_mode(request, call_next)
-
-    # ──────────────────────────────────────────────────────────────
-    # Agent-to-Agent payment flow (no human wallet popup)
-    # ──────────────────────────────────────────────────────────────
-
-    async def _handle_agent_mode(self, request: Request, call_next):
-        agent_address = request.headers.get("X-Agent-Address", "")
-        task_hash = request.headers.get("X-Task-Hash", "")
-        category = request.headers.get("X-Task-Category", "analysis")
-
-        if not agent_address:
-            return self._error(400, "X-Agent-Address header required in agent mode")
-
-        if not self.algorand.validate_address(agent_address):
-            return self._error(400, "Invalid agent address format")
-
-        if not task_hash:
-            return self._error(400, "X-Task-Hash header required")
-
-        # Determine cost
-        is_cached = await self.cache.check_exact(task_hash)
-        amount_microalgo = int(
-            (settings.CACHED_TASK_PRICE_ALGO if is_cached else settings.NEW_TASK_PRICE_ALGO)
-            * 1_000_000
-        )
-
-        # Verify agent is registered and within budget
-        try:
-            from contracts.deploy.contract_client import ContractClient
-            client = ContractClient()
-            ok = await client.verify_agent(agent_address, category, amount_microalgo)
-            if not ok:
-                return self._error(403, "Agent verification failed: not registered, over budget, or category not allowed")
-
-            # Record the spend atomically
-            await client.record_spend(agent_address, amount_microalgo)
-
-        except Exception as e:
-            logger.error(f"Agent mode contract check failed: {e}")
-            # Fail open in dev (no contracts deployed)
-            logger.warning("Agent mode: proceeding without on-chain verification (dev mode)")
-
-        # Attach agent info to request state
-        request.state.task_hash = task_hash
-        request.state.tx_id = f"agent-mode:{agent_address[:16]}"
-        request.state.payment_verified = True
-        request.state.agent_mode = True
-        request.state.agent_address = agent_address
-
-        return await call_next(request)
+            # STEP 1 — Validate agent address format
+            if not agent_address:
+                return self._error(400, "X-Agent-Address header required in agent mode")
+            
+            if not self.algorand.validate_address(agent_address):
+                return self._error(400, "Invalid agent address format")
+            
+            if not task_hash:
+                return self._error(400, "X-Task-Hash header required")
+            
+            # STEP 2 — Get price for this route
+            is_cached = await self.cache.check_exact(task_hash)
+            price_microalgo = int(
+                (settings.CACHED_TASK_PRICE_ALGO if is_cached else settings.NEW_TASK_PRICE_ALGO)
+                * 1_000_000
+            )
+            
+            # STEP 3 — Verify agent on-chain via contract_client
+            try:
+                from contracts.deploy.contract_client import ContractClient
+                client = ContractClient()
+                verified = await client.verify_agent(
+                    agent_address=agent_address,
+                    category=category,
+                    amount_microalgo=price_microalgo,
+                )
+                
+                if not verified:
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "success": False,
+                            "error": "Agent authorization failed",
+                            "data": {
+                                "reason": "Agent inactive, over budget, or category not allowed",
+                                "agent_address": agent_address,
+                                "required_amount_microalgo": price_microalgo,
+                            },
+                            "timestamp": self._now(),
+                        }
+                    )
+                
+                # STEP 4 — Record spend on-chain
+                await client.record_spend(agent_address, price_microalgo)
+                
+            except Exception as e:
+                logger.error(f"Agent mode verification failed: {e}")
+                # Fail open in dev mode (no contracts deployed)
+                logger.warning("Agent mode: proceeding without on-chain verification (dev mode)")
+            
+            # STEP 5 — Attach to request state and proceed
+            request.state.agent_mode = True
+            request.state.agent_address = agent_address
+            request.state.payment_verified = True
+            request.state.task_hash = task_hash
+            request.state.tx_id = f"agent-mode:{agent_address[:16]}"
+            
+            return await call_next(request)
+        
+        # Human payment flow (existing code)
+        return await self._handle_human_mode(request, call_next)
 
     # ──────────────────────────────────────────────────────────────
     # Human x402 payment flow (Pera Wallet)

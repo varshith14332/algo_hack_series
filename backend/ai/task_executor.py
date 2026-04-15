@@ -26,7 +26,10 @@ DEFAULT_SYSTEM = (
 
 class TaskExecutor:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            base_url=settings.OPENAI_BASE_URL,
+        )
         self.model = settings.OPENAI_CHAT_MODEL
 
     async def execute(self, task_type: str, task_text: str, file_content: str | None = None) -> str:

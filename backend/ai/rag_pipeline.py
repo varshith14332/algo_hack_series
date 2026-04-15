@@ -1,6 +1,6 @@
 from llama_index.core import VectorStoreIndex, Document, Settings as LlamaSettings
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.llms.ollama import Ollama
 from config import settings
 import logging
 
@@ -9,14 +9,16 @@ logger = logging.getLogger(__name__)
 
 class RAGPipeline:
     def __init__(self):
-        LlamaSettings.embed_model = OpenAIEmbedding(
-            model=settings.OPENAI_EMBEDDING_MODEL,
-            api_key=settings.OPENAI_API_KEY,
+        ollama_base = settings.OPENAI_BASE_URL.replace("/v1", "")
+        LlamaSettings.embed_model = OllamaEmbedding(
+            model_name=settings.OPENAI_EMBEDDING_MODEL,
+            base_url=ollama_base,
         )
-        LlamaSettings.llm = OpenAI(
+        LlamaSettings.llm = Ollama(
             model=settings.OPENAI_CHAT_MODEL,
-            api_key=settings.OPENAI_API_KEY,
+            base_url=ollama_base,
             temperature=0.2,
+            request_timeout=120.0
         )
 
     async def query(self, document_text: str, query: str) -> str:

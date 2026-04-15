@@ -20,6 +20,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting NeuralLedger API...")
     await init_db()
     await init_redis()
+    
+    # Register seller agent on startup
+    try:
+        from agents.seller_agent import SellerAgent
+        seller = SellerAgent()
+        await seller.register_on_chain()
+        logger.info("SellerAgent registered on startup")
+    except Exception as e:
+        logger.warning(f"SellerAgent registration failed: {e}")
+    
     yield
     await close_redis()
     logger.info("NeuralLedger API shutdown complete")

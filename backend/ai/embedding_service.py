@@ -7,7 +7,10 @@ logger = logging.getLogger(__name__)
 
 class EmbeddingService:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            base_url=settings.OPENAI_BASE_URL,
+        )
         self.model = settings.OPENAI_EMBEDDING_MODEL
 
     async def embed(self, text: str) -> list[float]:

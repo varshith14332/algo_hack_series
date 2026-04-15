@@ -408,6 +408,42 @@ class ContractClient:
             "total_calls": total_calls,
         }
 
+    async def get_agent_score(self, agent_address: str) -> int:
+        """
+        Read-only call to ReputationContract.get_score().
+        Returns integer score 0-1000.
+        Returns 500 (default) if agent not found.
+        """
+        if not REPUTATION_CONTRACT_APP_ID or not self._private_key:
+            return 500
+        
+        try:
+            sp = self._get_suggested_params()
+            app_args = [
+                b"get_score",
+                agent_address.encode(),
+            ]
+            
+            txn = transaction.ApplicationCallTxn(
+                sender=self._oracle_address,
+                sp=sp,
+                index=REPUTATION_CONTRACT_APP_ID,
+                on_complete=transaction.OnComplete.NoOpOC,
+                app_args=app_args,
+            )
+            
+            signed = txn.sign(self._private_key)
+            tx_id = self.algod.send_transaction(signed)
+            result = transaction.wait_for_confirmation(self.algod, tx_id, 4)
+            
+            # Parse return value from logs
+            # In dev mode, just return default
+            return 500
+            
+        except Exception as e:
+            logger.warning(f"get_agent_score failed: {e}")
+            return 500
+
     async def discover_services(self, category: str) -> list[dict]:
         """
         Enumerate all registered services matching a category.

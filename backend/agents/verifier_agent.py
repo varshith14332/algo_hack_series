@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 class VerifierAgent:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            base_url=settings.OPENAI_BASE_URL,
+        )
         self.merkle = MerkleService()
         self.ipfs = IPFSService()
         self.cache = CacheService()

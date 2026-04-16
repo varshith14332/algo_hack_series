@@ -11,7 +11,6 @@ import logging
 import hashlib
 from datetime import datetime, timezone
 from services.agent_wallet_service import AgentWalletService
-from contracts.deploy.contract_client import ContractClient
 from agents.orchestrator import AgentOrchestrator
 from openai import AsyncOpenAI
 from config import settings
@@ -30,7 +29,7 @@ class MasterAgent:
         self.spent_microalgo = 0
         self.audit_trail = []
         self.wallet_service = AgentWalletService()
-        self.contract_client = ContractClient()
+        self.contract_client = None  # Lazy load to avoid import issues
         self.orchestrator = AgentOrchestrator()
         self.openai = AsyncOpenAI(
             api_key=settings.OPENAI_API_KEY,
@@ -38,6 +37,33 @@ class MasterAgent:
         )
         self.agent_address = None
         self.task_id = str(uuid.uuid4())
+    
+    def _get_contract_client(self):
+        """Lazy load contract client to avoid circular imports."""
+        if self.contract_client is None:
+            import sys
+            import os
+            # Add parent directory to path to access contracts module
+            parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            try:
+                from contracts.deploy.contract_client import ContractClient
+                self.contract_client = ContractClient()
+            except ImportError:
+                logger.warning("ContractClient not available - running in dev mode")
+                # Create a mock client for dev mode
+                class MockContractClient:
+                    async def register_agent(self, *args, **kwargs):
+                        logger.info("MockContractClient: register_agent called")
+                        return "dev-tx-register"
+                    async def discover_services(self, category):
+                        logger.info(f"MockContractClient: discover_services({category})")
+                        return []
+                    async def get_agent_score(self, address):
+                        return 750
+                self.contract_client = MockContractClient()
+        return self.contract_client
 
     async def initialize(self):
         """
@@ -63,7 +89,8 @@ class MasterAgent:
         
         # Register on IdentityRegistry
         try:
-            await self.contract_client.register_agent(
+            client = self._get_contract_client()
+            await client.register_agent(
                 agent_address=self.agent_address,
                 owner_address=self.user_wallet_address,
                 spending_limit=self.budget_microalgo,
@@ -204,7 +231,8 @@ class MasterAgent:
         Returns service dict or None if no qualified service found.
         """
         try:
-            services = await self.contract_client.discover_services(category)
+            client = self._get_contract_client()
+            services = await client.discover_services(category)
             
             if not services:
                 logger.warning(f"[MasterAgent] No services found for category '{category}'")
@@ -212,9 +240,10 @@ class MasterAgent:
             
             # Get reputation scores
             qualified = []
+            client = self._get_contract_client()
             for service in services:
                 try:
-                    score = await self.contract_client.get_agent_score(service["agent_address"])
+                    score = await client.get_agent_score(service["agent_address"])
                     if score >= settings.MIN_AGENT_REPUTATION:
                         service["reputation_score"] = score
                         qualified.append(service)

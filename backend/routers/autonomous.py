@@ -7,7 +7,6 @@ from fastapi import APIRouter, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from algosdk import encoding
-from agents.master_agent import MasterAgent
 from db.redis_client import get_redis
 from services.agent_wallet_service import AgentWalletService
 from config import settings
@@ -159,6 +158,9 @@ async def _run_autonomous_pipeline(
     
     try:
         await update_status("Initializing agent identity", 5)
+        
+        # Import here to avoid module loading issues
+        from agents.master_agent import MasterAgent
         
         agent = MasterAgent(
             user_wallet_address=owner_address,

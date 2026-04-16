@@ -1,198 +1,183 @@
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from services.algorand_service import AlgorandService
 from services.cache_service import CacheService
 from config import settings
-from datetime import datetime, timezone
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 PROTECTED_ROUTES = {
     "/api/tasks/run",
+    "/api/tasks/result",
 }
 
-# Rate limiting: max 10 req/min per wallet (human mode)
-RATE_LIMIT = 10
-RATE_WINDOW = 60
+# All origins that should be allowed during development
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
 
-# Rate limiting for autonomous runs: max 3 concurrent per owner
-AUTONOMOUS_RATE_LIMIT = 3
-AUTONOMOUS_RATE_WINDOW = 300  # 5 minutes
+
+def add_cors_headers(response: Response, origin: str) -> Response:
+    """Manually attach CORS headers to any response."""
+    allowed = origin if origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
+    response.headers["Access-Control-Allow-Origin"] = allowed
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Payment-Proof, "
+        "X-Task-Hash, X-Wallet-Address, X-Agent-Mode, "
+        "X-Agent-Address, X-Category"
+    )
+    response.headers["Access-Control-Expose-Headers"] = (
+        "X-Payment-Recorded, X-Spend-Remaining"
+    )
+    return response
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _envelope(success: bool, data=None, error=None):
+    return {
+        "success": success,
+        "data": data,
+        "error": error,
+        "timestamp": _now()
+    }
 
 
 class X402Middleware(BaseHTTPMiddleware):
+
     def __init__(self, app):
         super().__init__(app)
-        self._algorand = None
-        self._cache = None
-
-    @property
-    def algorand(self):
-        if self._algorand is None:
-            self._algorand = AlgorandService()
-        return self._algorand
-
-    @property
-    def cache(self):
-        if self._cache is None:
-            self._cache = CacheService()
-        return self._cache
+        self.algorand = AlgorandService()
+        self.cache = CacheService()
 
     async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin", ALLOWED_ORIGINS[0])
+
+        # Always pass through OPTIONS preflight — let CORS middleware handle it
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         path = request.url.path
 
+        # Only intercept protected routes
         if path not in PROTECTED_ROUTES:
             return await call_next(request)
 
-        # AGENT MODE DETECTION — must run BEFORE human mode
+        # ── AGENT MODE ──────────────────────────────────────────────
         agent_mode = request.headers.get("X-Agent-Mode", "").lower() == "true"
         agent_address = request.headers.get("X-Agent-Address", "")
         category = request.headers.get("X-Category", "general")
         task_hash = request.headers.get("X-Task-Hash", "")
 
         if agent_mode:
-            # STEP 1 — Validate agent address format
-            if not agent_address:
-                return self._error(400, "X-Agent-Address header required in agent mode")
-            
-            if not self.algorand.validate_address(agent_address):
-                return self._error(400, "Invalid agent address format")
-            
-            if not task_hash:
-                return self._error(400, "X-Task-Hash header required")
-            
-            # STEP 2 — Get price for this route
-            is_cached = await self.cache.check_exact(task_hash)
-            price_microalgo = int(
-                (settings.CACHED_TASK_PRICE_ALGO if is_cached else settings.NEW_TASK_PRICE_ALGO)
-                * 1_000_000
-            )
-            
-            # STEP 3 — Verify agent on-chain via contract_client
+            from algosdk import encoding
+            if not agent_address or not encoding.is_valid_address(agent_address):
+                resp = JSONResponse(
+                    status_code=400,
+                    content=_envelope(False, error="Invalid or missing X-Agent-Address")
+                )
+                return add_cors_headers(resp, origin)
+
+            price = int(settings.NEW_TASK_PRICE_ALGO * 1_000_000)
+
             try:
                 from contracts.deploy.contract_client import ContractClient
                 client = ContractClient()
-                verified = await client.verify_agent(
-                    agent_address=agent_address,
-                    category=category,
-                    amount_microalgo=price_microalgo,
-                )
-                
-                if not verified:
-                    return JSONResponse(
-                        status_code=403,
-                        content={
-                            "success": False,
-                            "error": "Agent authorization failed",
-                            "data": {
-                                "reason": "Agent inactive, over budget, or category not allowed",
-                                "agent_address": agent_address,
-                                "required_amount_microalgo": price_microalgo,
-                            },
-                            "timestamp": self._now(),
-                        }
-                    )
-                
-                # STEP 4 — Record spend on-chain
-                await client.record_spend(agent_address, price_microalgo)
-                
+                verified = await client.verify_agent(agent_address, category, price)
             except Exception as e:
-                logger.error(f"Agent mode verification failed: {e}")
-                # Fail open in dev mode (no contracts deployed)
-                logger.warning("Agent mode: proceeding without on-chain verification (dev mode)")
-            
-            # STEP 5 — Attach to request state and proceed
+                logger.error(f"Agent verification error: {e}")
+                verified = False
+
+            if not verified:
+                resp = JSONResponse(
+                    status_code=403,
+                    content=_envelope(False, error="Agent authorization failed", data={
+                        "reason": "Agent inactive, over budget, or category not allowed",
+                        "agent_address": agent_address,
+                        "required_amount_microalgo": price
+                    })
+                )
+                return add_cors_headers(resp, origin)
+
+            try:
+                await client.record_spend(agent_address, price)
+            except Exception as e:
+                logger.warning(f"record_spend failed: {e}")
+
             request.state.agent_mode = True
             request.state.agent_address = agent_address
             request.state.payment_verified = True
             request.state.task_hash = task_hash
-            request.state.tx_id = f"agent-mode:{agent_address[:16]}"
-            
-            return await call_next(request)
-        
-        # Human payment flow (existing code)
-        return await self._handle_human_mode(request, call_next)
+            response = await call_next(request)
+            return add_cors_headers(response, origin)
 
-    # ──────────────────────────────────────────────────────────────
-    # Human x402 payment flow (Pera Wallet)
-    # ──────────────────────────────────────────────────────────────
-
-    async def _handle_human_mode(self, request: Request, call_next):
-        wallet = request.headers.get("X-Wallet-Address", "")
-        if wallet and not self.algorand.validate_address(wallet):
-            return self._error(400, "Invalid wallet address format")
-
-        if wallet:
-            rate_ok = await self._check_rate_limit(wallet)
-            if not rate_ok:
-                return self._error(429, "Rate limit exceeded: max 10 requests/min")
-
+        # ── HUMAN MODE (x402) ────────────────────────────────────────
         payment_proof = request.headers.get("X-Payment-Proof")
-        task_hash = request.headers.get("X-Task-Hash")
 
         if not task_hash:
-            return self._error(400, "X-Task-Hash header required")
+            resp = JSONResponse(
+                status_code=400,
+                content=_envelope(False, error="X-Task-Hash header required")
+            )
+            return add_cors_headers(resp, origin)
 
         if not payment_proof:
+            # Return 402 — this is the payment request
             is_cached = await self.cache.check_exact(task_hash)
-            price = settings.CACHED_TASK_PRICE_ALGO if is_cached else settings.NEW_TASK_PRICE_ALGO
-            escrow_address = settings.ORACLE_ADDRESS
+            price = (
+                settings.CACHED_TASK_PRICE_ALGO
+                if is_cached
+                else settings.NEW_TASK_PRICE_ALGO
+            )
 
-            return JSONResponse(status_code=402, content={
-                "success": False,
-                "error": "Payment required",
-                "data": {
+            try:
+                from contracts.deploy.contract_client import ContractClient
+                escrow_address = settings.ORACLE_ADDRESS
+            except Exception:
+                escrow_address = settings.ORACLE_ADDRESS
+
+            resp = JSONResponse(
+                status_code=402,
+                content=_envelope(False, error="Payment required", data={
                     "payment_required": True,
                     "amount_algo": price,
                     "receiver": escrow_address,
                     "task_hash": task_hash,
                     "is_cached": is_cached,
-                    "note": f"neuralledger:{task_hash}",
-                },
-                "timestamp": self._now(),
-            })
+                    "note": f"neuralledger:{task_hash}"
+                })
+            )
+            # ← THIS IS THE CRITICAL LINE — CORS on 402
+            return add_cors_headers(resp, origin)
 
-        # Verify payment on-chain
+        # Payment proof provided — verify it
         verified = await self.algorand.verify_transaction(
             tx_id=payment_proof,
             task_hash=task_hash,
         )
 
         if not verified:
-            return self._error(402, "Payment verification failed")
+            resp = JSONResponse(
+                status_code=402,
+                content=_envelope(False, error="Payment verification failed")
+            )
+            return add_cors_headers(resp, origin)
 
         request.state.task_hash = task_hash
         request.state.tx_id = payment_proof
         request.state.payment_verified = True
         request.state.agent_mode = False
 
-        return await call_next(request)
-
-    async def _check_rate_limit(self, wallet: str) -> bool:
-        try:
-            from db.redis_client import get_redis
-            redis = await get_redis()
-            key = f"rate:{wallet}"
-            count = await redis.get(key)
-            if count and int(count) >= RATE_LIMIT:
-                return False
-            pipe = redis.pipeline()
-            await pipe.incr(key)
-            await pipe.expire(key, RATE_WINDOW)
-            await pipe.execute()
-            return True
-        except Exception:
-            return True  # Fail open on Redis error
-
-    def _error(self, status: int, message: str):
-        return JSONResponse(status_code=status, content={
-            "success": False,
-            "error": message,
-            "data": None,
-            "timestamp": self._now(),
-        })
-
-    def _now(self):
-        return datetime.now(timezone.utc).isoformat()
+        response = await call_next(request)
+        return add_cors_headers(response, origin)

@@ -1,12 +1,11 @@
-import { algorandService } from './algorand'
-import type { PaymentRequest } from '../types/payment'
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL ?? 'http://localhost:8000'
-
-export interface X402Result {
-  success: boolean
-  data: unknown
-  error?: string
+export interface PaymentRequest {
+  amount_algo: number;
+  receiver: string;
+  task_hash: string;
+  is_cached: boolean;
+  note: string;
 }
 
 export async function executeWithPayment(
@@ -15,8 +14,9 @@ export async function executeWithPayment(
   walletAddress: string,
   onPaymentRequired: (req: PaymentRequest) => Promise<boolean>,
   body?: FormData
-): Promise<X402Result> {
-  // Step 1: Probe — expect 402
+): Promise<unknown> {
+  
+  // Step 1 — Probe request, expect 402
   const probe = await fetch(`${BACKEND_URL}${endpoint}`, {
     method: 'POST',
     headers: {
@@ -24,33 +24,56 @@ export async function executeWithPayment(
       'X-Wallet-Address': walletAddress,
     },
     body,
-  })
+  });
 
+  // If not 402, something else happened
   if (probe.status !== 402) {
-    return probe.json() as Promise<X402Result>
+    return probe.json();
   }
 
-  const probeData = await probe.json() as { data: PaymentRequest }
-  const paymentRequest = probeData.data
+  // Step 2 — Parse the 402 payment request
+  let probeData: { data: PaymentRequest };
+  try {
+    probeData = await probe.json();
+  } catch {
+    throw new Error('Invalid 402 response from server');
+  }
 
-  // Step 2: Show confirmation modal
-  const confirmed = await onPaymentRequired(paymentRequest)
+  const paymentRequest = probeData.data;
+
+  if (!paymentRequest?.amount_algo || !paymentRequest?.receiver) {
+    throw new Error('Incomplete payment request received');
+  }
+
+  // Step 3 — Ask user to confirm payment
+  const confirmed = await onPaymentRequired(paymentRequest);
   if (!confirmed) {
-    throw new Error('User cancelled payment')
+    throw new Error('User cancelled payment');
   }
 
-  // Step 3: Build and sign transaction via Pera Wallet
-  const txId = await algorandService.sendPayment({
-    from: walletAddress,
-    to: paymentRequest.receiver,
-    amountAlgo: paymentRequest.amount_algo,
-    note: paymentRequest.note,
-  })
+  // Step 4 — Import algorand service and send payment
+  const { algorandService } = await import('./algorand');
 
-  // Step 4: Wait for confirmation on-chain
-  await algorandService.waitForConfirmation(txId)
+  let txId: string;
+  try {
+    txId = await algorandService.sendPayment({
+      from: walletAddress,
+      to: paymentRequest.receiver,
+      amountAlgo: paymentRequest.amount_algo,
+      note: paymentRequest.note,
+    });
+  } catch (err) {
+    throw new Error(`Payment signing failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+  }
 
-  // Step 5: Retry with payment proof
+  // Step 5 — Wait for Algorand confirmation
+  try {
+    await algorandService.waitForConfirmation(txId);
+  } catch {
+    throw new Error(`Transaction ${txId} failed to confirm`);
+  }
+
+  // Step 6 — Retry with payment proof
   const result = await fetch(`${BACKEND_URL}${endpoint}`, {
     method: 'POST',
     headers: {
@@ -59,7 +82,7 @@ export async function executeWithPayment(
       'X-Payment-Proof': txId,
     },
     body,
-  })
+  });
 
-  return result.json() as Promise<X402Result>
+  return result.json();
 }

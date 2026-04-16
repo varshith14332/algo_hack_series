@@ -15,6 +15,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Build allowed origins list for CORS (bulletproof for local dev)
+allowed_origins = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+
+# Also add whatever is in .env
+if settings.FRONTEND_URL not in allowed_origins:
+    allowed_origins.append(settings.FRONTEND_URL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting NeuralLedger API...")
@@ -44,10 +58,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 app.add_middleware(X402Middleware)

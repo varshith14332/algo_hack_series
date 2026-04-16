@@ -24,8 +24,19 @@ class SellerAgent:
             return
         
         if self.contract_client is None:
-            from contracts.deploy.contract_client import ContractClient
-            self.contract_client = ContractClient()
+            import sys
+            import os
+            # Add parent directory to path to access contracts module
+            parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if parent_dir not in sys.path:
+                sys.path.insert(0, parent_dir)
+            try:
+                from contracts.deploy.contract_client import ContractClient
+                self.contract_client = ContractClient()
+            except ImportError:
+                logger.warning("ContractClient not available - running in dev mode")
+                self._registered = True
+                return
         
         try:
             service_data = {
